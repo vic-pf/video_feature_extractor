@@ -5,7 +5,6 @@ import os
 import numpy as np
 import ffmpeg
 
-
 class VideoLoader(Dataset):
     """Pytorch video loader."""
 
@@ -47,14 +46,14 @@ class VideoLoader(Dataset):
         video_path = self.csv['video_path'].values[idx]
         output_file = self.csv['feature_path'].values[idx]
 
-        if not(os.path.isfile(output_file)) and os.path.isfile(video_path):
-            print('Decoding video: {}'.format(video_path))
+        if not os.path.isfile(output_file) and os.path.isfile(video_path):
+            print(f'Decoding video: {video_path}')
             try:
                 h, w = self._get_video_dim(video_path)
-            except:
-                print('ffprobe failed at: {}'.format(video_path))
-                return {'video': th.zeros(1), 'input': video_path,
-                        'output': output_file}
+            except Exception as e:
+                print(f'ffprobe failed at {video_path}: {e}')
+                return {'video': th.zeros(1, 3, self.size, self.size), 'input': video_path, 'output': output_file}
+            
             height, width = self._get_output_dim(h, w)
             cmd = (
                 ffmpeg
@@ -66,16 +65,20 @@ class VideoLoader(Dataset):
                 x = int((width - self.size) / 2.0)
                 y = int((height - self.size) / 2.0)
                 cmd = cmd.crop(x, y, self.size, self.size)
-            out, _ = (
-                cmd.output('pipe:', format='rawvideo', pix_fmt='rgb24')
-                .run(capture_stdout=True, quiet=True)
-            )
-            if self.centercrop and isinstance(self.size, int):
-                height, width = self.size, self.size
-            video = np.frombuffer(out, np.uint8).reshape([-1, height, width, 3])
-            video = th.from_numpy(video.astype('float32'))
-            video = video.permute(0, 3, 1, 2)
+            try:
+                out, _ = (
+                    cmd.output('pipe:', format='rawvideo', pix_fmt='rgb24')
+                    .run(capture_stdout=True, quiet=True)
+                )
+                if self.centercrop and isinstance(self.size, int):
+                    height, width = self.size, self.size
+                video = np.frombuffer(out, np.uint8).reshape([-1, height, width, 3])
+                video = th.from_numpy(video.astype('float32'))
+                video = video.permute(0, 3, 1, 2)
+            except Exception as e:
+                print(f'Error decoding video {video_path}: {e}')
+                video = th.zeros(1, 3, self.size, self.size)
         else:
-            video = th.zeros(1)
-            
+            video = th.zeros(1, 3, self.size, self.size)
+
         return {'video': video, 'input': video_path, 'output': output_file}
