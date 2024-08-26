@@ -1,218 +1,127 @@
-import torch as th
-import math
-import numpy as np
-from video_loader import VideoLoader
-from torch.utils.data import DataLoader
-import argparse
-from model import get_model
-from preprocessing import Preprocessing
-from random_sequence_shuffler import RandomSequenceSampler
-import torch.nn.functional as F
-import subprocess
-import librosa
-import scipy
-import os
-import time
-import torchaudio
-import torchaudio.transforms as T
 import torch
+import os
+import numpy as np
+import pickle
+import re
+from gensim.models.keyedvectors import KeyedVectors
 
+_CLASS_ID = {'fast-food': '0', 'food-drink': '1', 'non-food': '2', 'supermarket': '3'}
 
-# Audio processing functions
+# Set the feature directory path
+_FEATURE_DIR_ROOT = '/home/victoria/dataset/youtube/videos/features'
+we = KeyedVectors.load_word2vec_format('/home/victoria/dataset/GoogleNews-vectors-negative300.bin', binary=True)
 
+def _tokenize_text(sentence):
+    w = re.findall(r"[\w']+", str(sentence))
+    return w
 
-def extract_audio(input_file, output_file):
-    """ Extracts audio at the native sampling rate into a separate wav file. """
-    with open('ffmpeg_log.txt', 'w') as log_file:
-        subprocess.call(['ffmpeg', '-i', input_file, '-vn',
-                        output_file], stdout=log_file, stderr=log_file)
+def create_text_features(words, max_words, we, we_dim):
+    raw_text = ' '.join(words)
+    words = [word for word in words if word in we.vocab]
+    text = np.zeros((max_words, we_dim), dtype=np.float32)
+    text_mask = np.zeros(max_words, dtype=np.float32)
+    nwords = min(len(words), max_words)
+    if nwords > 0:
+        text[:nwords] = we[words][:nwords]
+        text_mask[:nwords] = 1
+    text = torch.from_numpy(text).float()
+    text_mask = torch.from_numpy(text_mask).float()
 
+    return text, text_mask, raw_text
 
-def stereo_to_mono_downsample(input_file, output_file, sample_rate=16000):
-    # Load audio using TorchAudio
-    waveform, original_sample_rate = torchaudio.load(input_file)
-    
-    # Move waveform to GPU
-    waveform = waveform.to('cuda')
-    
-    # Convert to mono by averaging channels if it's stereo
-    if waveform.size(0) > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
-    
-    # Resample audio to the target sample rate
-    resample_transform = T.Resample(orig_freq=original_sample_rate, new_freq=sample_rate).to('cuda')
-    waveform = resample_transform(waveform)
-    
-    # Move waveform back to CPU and save it
-    waveform = waveform.cpu()
-    torchaudio.save(output_file, waveform, sample_rate)
+def load_features(feature_dir):
+    """
+    Load video and audio features from .npy files and save them into a pickle file.
+    """
+    print(f"Starting to load features from {feature_dir}...")
 
-
-def LoadAudio(path, target_length=2048, use_raw_length=False):
-    """ Convert audio wav file to mel spectrogram features """
-    try:
-        audio_type = 'melspectrogram'
-        preemph_coef = 0.97
-        sample_rate = 16000
-        window_size = 0.025
-        window_stride = 0.01
-        window_type = 'hamming'
-        num_mel_bins = 40
-        padval = 0
-        fmin = 20
-        n_fft = int(sample_rate * window_size)
-        win_length = int(sample_rate * window_size)
-        hop_length = int(sample_rate * window_stride)
-        windows = {'hamming': lambda M: scipy.signal.get_window('hamming', M)}
-
-        y, sr = librosa.load(path, sr=None)
-        print(f"Loaded audio with shape {y.shape} for file {path}")
-
-        if y.size == 0:
-            print(f"Warning: Audio data is empty for file {path}")
-            y = np.zeros(200)
-
-        y = y - y.mean()
-        y = preemphasis(y, preemph_coef)
-
-        print(f"Computing STFT for file {path}")
-        stft = librosa.stft(y, n_fft=n_fft, hop_length=hop_length,
-                            win_length=win_length, window=windows[window_type])
-
-        spec = np.abs(stft)**2
-
-        if audio_type == 'melspectrogram':
-            print(f"Computing mel spectrogram for file {path}")
-            mel_basis = librosa.filters.mel(
-                sr=sample_rate, n_fft=n_fft, n_mels=num_mel_bins, fmin=fmin)
-            melspec = np.dot(mel_basis, spec)
-            feats = librosa.power_to_db(melspec, ref=np.max)
-
-        n_frames = feats.shape[1]
-        if use_raw_length:
-            target_length = n_frames
-
-        p = target_length - n_frames
-        if p > 0:
-            feats = np.pad(feats, ((0, 0), (0, p)), 'constant',
-                           constant_values=(padval, padval))
-        elif p < 0:
-            feats = feats[:, 0:p]
-
-        return feats, n_frames
-
-    except Exception as e:
-        print(f"Error processing audio for file {path}: {e}")
-        return None, 0
-
-
-def preemphasis(signal, coeff=0.97):
-    """ Perform preemphasis on the input signal. """
-    return np.append(signal[0], signal[1:] - coeff * signal[:-1])
-
-
-# Argument parser
-parser = argparse.ArgumentParser(description='Easy video feature extractor')
-
-parser.add_argument('--csv', type=str, help='input csv with video input path')
-parser.add_argument('--batch_size', type=int, default=64, help='batch size')
-parser.add_argument('--type', type=str, default='2d', help='CNN type')
-parser.add_argument('--half_precision', type=int, default=1,
-                    help='output half precision float')
-parser.add_argument('--num_decoding_thread', type=int,
-                    default=4, help='Num parallel thread for video decoding')
-parser.add_argument('--l2_normalize', type=int, default=1,
-                    help='l2 normalize feature')
-parser.add_argument('--resnext101_model_path', type=str,
-                    default='model/resnext101.pth', help='Resnext model path')
-parser.add_argument('--time_limit', type=int, default=60, help='Time limit in seconds for processing each video')
-args = parser.parse_args()
-
-# Video loader and model setup
-dataset = VideoLoader(args.csv, framerate=1 if args.type == '2d' else 24,
-                      size=224 if args.type == '2d' else 112, centercrop=(args.type == '3d'))
-n_dataset = len(dataset)
-sampler = RandomSequenceSampler(n_dataset, 10)
-loader = DataLoader(dataset, batch_size=1, shuffle=False,
-                    num_workers=args.num_decoding_thread, sampler=sampler if n_dataset > 10 else None)
-preprocess = Preprocessing(args.type)
-model = get_model(args)
-
-timeout_files = []
-
-with th.no_grad():
-    for k, data in enumerate(loader):
-        start_time = time.time()
-        
-        input_file = '/home/victoria' + data['input'][0]
-        output_file_base = '/home/victoria' + data['output'][0]
-        
-        if not os.path.exists(input_file):
+    for _TYPE in os.listdir(feature_dir):
+        if _TYPE.lower() not in ('train', 'test', 'val'):
+            print(f"Skipping unknown type {_TYPE}")
             continue
-        if not os.path.exists(output_file_base):
-            os.makedirs(output_file_base)
 
-        output_file_video = f"{output_file_base}/{args.type}.npy"
-        output_file_audio = f"{output_file_base}/audio.wav"
-        output_file_audio_mono = output_file_audio.replace('.wav', '_mono.wav')
-        output_file_audio_features = output_file_audio.replace('.wav', '.npy')
+        type_path = os.path.join(feature_dir, _TYPE)
+        print(f"Processing {_TYPE} data in {type_path}...")
 
-        if len(data['video'].shape) > 3:
-            print(f'Computing features of video {k + 1}/{n_dataset}: {input_file}')
-            video = data['video'].squeeze(0)  # Squeeze only the batch dimension
+        # List to store the features
+        feature_list = []
 
-            if len(video.shape) == 3:
-                # Add a time dimension if it's missing
-                video = video.unsqueeze(0)
+        # Iterate over all classes
+        for class_name in os.listdir(type_path):
+            if class_name not in _CLASS_ID:
+                print(f"Skipping unknown class {class_name}")
+                continue
 
-            if len(video.shape) == 4:  # Expected shape: [num_frames, 3, height, width]
+            class_path = os.path.join(type_path, class_name)
+            print(f"Processing class {class_name} in {class_path}...")
+
+            if not os.path.isdir(class_path):
+                print(f"Skipping {class_path} as it is not a directory")
+                continue
+
+            # Iterate over all video files in the class directory
+            for video_id in os.listdir(class_path):
+                video_data = {'id': video_id, 'class': class_name, 'label': _CLASS_ID[class_name]}
+
+                # Define the caption
+                if class_name == 'non-food':
+                    caption = 'other'
+                elif class_name == 'food-drink':
+                    caption = 'aliment-drink'
+                else:
+                    caption = class_name
+
+                words = _tokenize_text(caption)
+                text, text_mask, raw_text = create_text_features(words, 20, we, 300)
+
+                video_data['caption'] = caption
+                video_data['text'] = text
+                video_data['text_mask'] = text_mask
+                video_data['raw_text'] = raw_text
+
+                video_path = os.path.join(class_path, video_id)
+                print(f"Processing video {video_id} at {video_path}...")
+
+                # Initialize flags to check presence of features
+                has_2d = has_3d = has_audio = False
+                
                 try:
-                    if not os.path.exists(output_file_video):
-                        video = preprocess(video)
-                        n_chunk = len(video)
-                        features = th.cuda.FloatTensor(n_chunk, 2048).fill_(0)
-                        n_iter = int(math.ceil(n_chunk / float(args.batch_size)))
-                        for i in range(n_iter):
-                            min_ind = i * args.batch_size
-                            max_ind = (i + 1) * args.batch_size
-                            video_batch = video[min_ind:max_ind].cuda()
-                            batch_features = model(video_batch)
-                            if args.l2_normalize:
-                                batch_features = F.normalize(batch_features, dim=1)
-                            features[min_ind:max_ind] = batch_features
-                            
-                            # Check if time exceeded
-                            if time.time() - start_time > args.time_limit:
-                                print(f"Time exceeded for video {input_file}, deleting output files.")
-                                timeout_files.append(input_file)
-                                raise TimeoutError("Time limit exceeded")
+                    feature_2d_path = os.path.join(video_path, '2d.npy')
+                    feature_3d_path = os.path.join(video_path, '3d.npy')
+                    audio_feature_path = os.path.join(video_path, 'audio.npy')
 
-                        features = features.cpu().numpy()
-                        if args.half_precision:
-                            features = features.astype('float16')
-                        np.save(output_file_video, features)
-                        print(f'Video saved for file: {input_file}')
+                    if os.path.exists(feature_2d_path):
+                        print(f"Loading 2D features from {feature_2d_path}")
+                        video_data['2d'] = np.load(feature_2d_path)
+                        has_2d = True
 
-                    if not os.path.exists(output_file_audio_features):
-                        if not os.path.exists(output_file_audio):
-                            extract_audio(input_file, output_file_audio)
-                        if not os.path.exists(output_file_audio_mono):
-                            stereo_to_mono_downsample(output_file_audio, output_file_audio_mono)
+                    if os.path.exists(feature_3d_path):
+                        print(f"Loading 3D features from {feature_3d_path}")
+                        video_data['3d'] = np.load(feature_3d_path)
+                        has_3d = True
 
-                        # Load and save audio features
-                        audio_features, _ = LoadAudio(output_file_audio_mono)
-                        np.save(output_file_audio_features, audio_features)
-                        print(f'Video audio saved for file: {input_file}')
-                
-                except TimeoutError:
-                    if os.path.exists(output_file_base):
-                        subprocess.call(['rm', '-rf', output_file_base])
-                    continue
-                
-        else:
-            print(f'Unexpected video shape: {data["video"].shape}')
+                    if os.path.exists(audio_feature_path):
+                        print(f"Loading audio features from {audio_feature_path}")
+                        video_data['audio'] = np.load(audio_feature_path)
+                        has_audio = True
 
-# Save the list of files that exceeded the time limit
-with open('timeout_files.txt', 'w') as f:
-    for file in timeout_files:
-        f.write(f"{file}\n")
+                    # Append to the list only if all features are present
+                    if has_2d and has_3d and has_audio:
+                        feature_list.append(video_data)
+                        print(f"Features successfully loaded and added for video {video_id}")
+                    else:
+                        print(f"Skipping video {video_id} due to missing features")
+
+                except Exception as e:
+                    print(f"Error loading features for {video_id}: {e}")
+
+        # Save the feature list to a pickle file
+        pickle_file_path = os.path.join(feature_dir, f'{_TYPE}.pkl')
+        with open(pickle_file_path, 'wb') as f:
+            pickle.dump(feature_list, f)
+
+        print(f"Features saved to {pickle_file_path} for {_TYPE} data")
+        print(f"Dataset size for {_TYPE}: {len(feature_list)} samples")
+
+# Call the function to load features and save them to a pickle file
+load_features(_FEATURE_DIR_ROOT)
